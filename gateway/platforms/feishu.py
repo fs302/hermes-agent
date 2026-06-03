@@ -139,6 +139,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    resolve_channel_prompt,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -2410,16 +2411,33 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = getattr(message, "message_id", None)
+        chat_id = getattr(message, "chat_id", "") or ""
+        chat_type = getattr(message, "chat_type", "p2p") or "p2p"
+        raw_type = getattr(message, "message_type", "") or ""
+        logger.info(
+            "[Feishu] Received raw message type=%s message_id=%s chat_id=%s chat_type=%s",
+            raw_type,
+            message_id,
+            chat_id,
+            chat_type,
+        )
         if not message_id or self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
         reason = self._admit(sender, message)
         if reason is not None:
-            logger.debug("[Feishu] dropping inbound event: %s", reason)
+            logger.info(
+                "[Feishu] Dropping inbound event: reason=%s chat_id=%s chat_type=%s "
+                "require_mention=%s sender_type=%s",
+                reason,
+                chat_id,
+                chat_type,
+                self._require_mention_for(chat_id) if chat_type != "p2p" else False,
+                getattr(sender, "sender_type", ""),
+            )
             return
 
-        chat_type = getattr(message, "chat_type", "p2p")
         await self._process_inbound_message(
             data=data,
             message=message,
@@ -2963,35 +2981,584 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._pending_processing_reactions.pop(message_id, None)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        if not self._reactions_enabled():
-            return
-        message_id = event.message_id
-        if not message_id or message_id in self._pending_processing_reactions:
-            return
-        reaction_id = await self._add_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
-        if reaction_id:
-            self._remember_processing_reaction(message_id, reaction_id)
+        if self._reactions_enabled():
+            message_id = event.message_id
+            if message_id and message_id not in self._pending_processing_reactions:
+                reaction_id = await self._add_reaction(
+                    message_id, _FEISHU_REACTION_IN_PROGRESS
+                )
+                if reaction_id:
+                    self._remember_processing_reaction(message_id, reaction_id)
+
+        # ------------------------------------------------------------------
+        # Session memory: load (and rebuild, if necessary) BEFORE the agent
+        # starts thinking, then attach to the event as a transient block.
+        # The agent sees the memory in its context even if Hermes has been
+        # restarted, the SQLite transcript has been trimmed, or the user
+        # is on a brand new device in the same topic.
+        # ------------------------------------------------------------------
+        try:
+            await self._inject_session_memory(event)
+        except Exception as _mem_err:
+            # Memory must NEVER break message processing.  Logged at
+            # WARNING with a stack trace so the operator can debug, then
+            # the agent continues with no memory — the worst case is the
+            # pre-fix behaviour.
+            logger.warning(
+                "[Feishu] session memory inject failed: %s",
+                _mem_err, exc_info=True,
+            )
 
     async def on_processing_complete(
-        self, event: MessageEvent, outcome: ProcessingOutcome
+        self, event: MessageEvent, outcome: ProcessingOutcome, response: Optional[str] = None,
     ) -> None:
-        if not self._reactions_enabled():
-            return
-        message_id = event.message_id
-        if not message_id:
-            return
+        if self._reactions_enabled():
+            message_id = event.message_id
+            if message_id:
+                start_reaction_id = self._pending_processing_reactions.get(message_id)
+                if start_reaction_id:
+                    if not await self._remove_reaction(message_id, start_reaction_id):
+                        # Don't stack a second badge on top of a Typing we couldn't
+                        # remove — UI would read as both "working" and "done/failed"
+                        # simultaneously. Keep the handle so LRU eventually evicts it.
+                        return
+                    self._pop_processing_reaction(message_id)
 
-        start_reaction_id = self._pending_processing_reactions.get(message_id)
-        if start_reaction_id:
-            if not await self._remove_reaction(message_id, start_reaction_id):
-                # Don't stack a second badge on top of a Typing we couldn't
-                # remove — UI would read as both "working" and "done/failed"
-                # simultaneously. Keep the handle so LRU eventually evicts it.
-                return
-            self._pop_processing_reaction(message_id)
+                if outcome is ProcessingOutcome.FAILURE:
+                    await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
 
-        if outcome is ProcessingOutcome.FAILURE:
-            await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        # ------------------------------------------------------------------
+        # Session memory: persist a refreshed task state from this turn.
+        # Best-effort: any failure is logged at WARNING and does not break
+        # message processing.
+        # ------------------------------------------------------------------
+        try:
+            await self._persist_session_memory(event, response=response)
+        except Exception as _persist_err:
+            logger.warning(
+                "[Feishu] session memory persist failed: %s",
+                _persist_err, exc_info=True,
+            )
+
+    # =========================================================================
+    # Session memory integration
+    # =========================================================================
+
+    def _build_session_key(self, event: MessageEvent) -> str:
+        """Stable session_key for the current event.
+
+        Prefers the Feishu-specific builder (one-key-per-thread) so
+        Day-1 and Day-2 messages in the same topic land on the same
+        memory file.  Falls back to the generic builder for sources
+        where Feishu semantics don't apply (DMs with no thread_id
+        still benefit from the user-scoped generic key).
+        """
+        try:
+            from gateway.session import (
+                build_session_key,
+                feishu_thread_session_key,
+            )
+        except ImportError:
+            build_session_key = None
+            feishu_thread_session_key = None
+
+        source = getattr(event, "source", None)
+        if source is None:
+            # Synthetic / test event — use the raw message_id as a
+            # last-ditch identifier so memory I/O does not crash.
+            mid = getattr(event, "message_id", None) or "unknown"
+            return f"agent:main:feishu:synthetic:{mid}"
+
+        thread_id = getattr(source, "thread_id", None) or None
+        parent_id = getattr(source, "parent_chat_id", None) or None
+
+        # Feishu-specific path: any inbound that has a thread_id (or
+        # that the message handler could derive a parent from) gets a
+        # thread-scoped key so cross-day continuity survives.
+        platform_value = getattr(getattr(source, "platform", None), "value", None)
+        if feishu_thread_session_key is not None and platform_value == "feishu":
+            key = feishu_thread_session_key(
+                chat_id=getattr(source, "chat_id", "") or "",
+                thread_id=thread_id,
+                parent_message_id=parent_id,
+                user_id=getattr(source, "user_id", None) or None,
+                chat_type=getattr(source, "chat_type", None) or "group",
+            )
+            if key:
+                logger.info(
+                    "[Feishu] session_key thread-scoped: chat_id=%s thread_id=%s -> %s",
+                    getattr(source, "chat_id", ""), thread_id, key,
+                )
+                return key
+
+        if build_session_key is None:
+            return f"agent:main:feishu:{getattr(source, 'chat_id', 'unknown')}"
+
+        extra = getattr(self.config, "extra", None)
+        group_per_user = True
+        if isinstance(extra, dict):
+            group_per_user = bool(extra.get("group_sessions_per_user", True))
+        return build_session_key(
+            source,
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=False,
+        )
+
+    async def _inject_session_memory(self, event: MessageEvent) -> None:
+        """Load session memory and (if needed) rebuild from Feishu history.
+
+        Steps:
+
+        1. Build the stable ``session_key`` for this event.
+        2. Call :func:`load_session_memory`.  If it is missing or
+           meaningfully empty, fall back to a Feishu thread history
+           fetch and reconstruct a minimal memory.
+        3. Format the memory into a system-prompt block.
+        4. Prepend the block to ``event.channel_prompt`` (preserving
+           any user-configured per-channel prompt) so the model sees
+           it on the next LLM call.
+        5. Stash the live :class:`SessionMemory` on the event for
+           ``on_processing_complete`` to refresh.
+        """
+        from gateway.session_memory import (
+            SessionMemory,
+            TaskState,
+            load_session_memory,
+            needs_thread_history_fallback,
+            update_session_memory,
+        )
+
+        session_key = self._build_session_key(event)
+        memory = load_session_memory(session_key)
+        memory_hit = memory is not None and not memory.is_meaningfully_empty()
+
+        fallback_used = False
+        fallback_messages = 0
+        if needs_thread_history_fallback(memory):
+            reconstructed = await self._reconstruct_memory_from_thread(event)
+            if reconstructed is not None:
+                memory = reconstructed
+                fallback_used = True
+                fallback_messages = len(reconstructed.get("_reconstructed_messages", []))
+                # Persist the reconstruction so the *next* turn does not
+                # pay the API cost again.
+                try:
+                    update_session_memory(
+                        session_key,
+                        platform="feishu",
+                        chat_id=getattr(event.source, "chat_id", ""),
+                        thread_id=getattr(event.source, "thread_id", "") or "",
+                        project=memory.project,
+                        topic=memory.topic,
+                        session_summary=memory.session_summary,
+                        task_state=memory.current_task_state,
+                        open_todos=memory.open_todos,
+                        important_decisions=memory.important_decisions,
+                        related_files_or_modules=memory.related_files_or_modules,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Feishu] Failed to persist reconstructed memory for %s: %s",
+                        session_key, e,
+                    )
+
+        # Build the prompt block and inject it.
+        prompt_block = self._format_session_memory_prompt(memory or SessionMemory(session_key=session_key))
+        if prompt_block:
+            existing = (event.channel_prompt or "").strip()
+            event.channel_prompt = (
+                f"{prompt_block}\n\n{existing}" if existing else prompt_block
+            )
+
+        # Stash for the post-processing update.  Use object.__setattr__
+        # to dodge any future dataclass slots() on MessageEvent.
+        try:
+            object.__setattr__(event, "_session_memory", memory)
+            object.__setattr__(event, "_session_key", session_key)
+        except Exception:
+            # Plain attribute assignment (works on the current dataclass).
+            event._session_memory = memory
+            event._session_key = session_key
+
+        # Observability: one structured INFO line per inbound.
+        try:
+            recent_count = self._count_recent_inbound_messages(event)
+        except Exception:
+            recent_count = 0
+
+        logger.info(
+            "[Feishu][session] msg_id=%s chat_id=%s thread_id=%s "
+            "parent_chat_id=%s session_key=%s memory_hit=%s "
+            "fallback_used=%s fallback_msgs=%d recent_inbound=%d "
+            "injected_prompt_chars=%d",
+            event.message_id or "",
+            getattr(event.source, "chat_id", ""),
+            getattr(event.source, "thread_id", "") or "",
+            getattr(event.source, "parent_chat_id", "") or "",
+            session_key,
+            memory_hit,
+            fallback_used,
+            fallback_messages,
+            recent_count,
+            len(prompt_block or ""),
+        )
+
+    async def _reconstruct_memory_from_thread(
+        self, event: MessageEvent
+    ):
+        """Fetch Feishu thread history and rebuild a minimal :class:`SessionMemory`.
+
+        Returns ``None`` when no history is available — the caller will
+        then proceed with a fresh (empty) memory.  Returning ``None``
+        is preferred over raising so a transient Feishu API error
+        does not block the user's reply.
+        """
+        from gateway.session_memory import SessionMemory, TaskState
+
+        chat_id = getattr(event.source, "chat_id", "") or ""
+        thread_id = getattr(event.source, "thread_id", "") or None
+        parent_id = (
+            getattr(event, "reply_to_message_id", None)
+            or getattr(event.source, "parent_chat_id", None)
+            or None
+        )
+        if not chat_id and not thread_id and not parent_id:
+            return None
+
+        client = getattr(self, "_client", None)
+        if client is None:
+            logger.info(
+                "[Feishu] No lark client available; skipping thread history fallback"
+            )
+            return None
+
+        try:
+            from gateway.platforms.feishu_thread_history import fetch_thread_history
+        except ImportError as e:
+            logger.warning("[Feishu] feishu_thread_history import failed: %s", e)
+            return None
+
+        try:
+            result = await fetch_thread_history(
+                client,
+                thread_id=thread_id,
+                parent_message_id=parent_id,
+                chat_id=chat_id,
+                window_hours=72,
+                bot_open_id=self._bot_open_id() if hasattr(self, "_bot_open_id") else None,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Feishu] Thread history fetch raised: %s", e, exc_info=True,
+            )
+            return None
+
+        if not result.ok or not result.messages:
+            logger.info(
+                "[Feishu] Thread history empty: tier=%s err=%s",
+                result.tier_used, result.error,
+            )
+            return None
+
+        transcript = result.to_transcript()
+        summary = self._summarise_transcript(transcript)
+        proposals = self._extract_proposals_from_transcript(transcript)
+
+        memory = SessionMemory(
+            session_key=self._build_session_key(event),
+            platform="feishu",
+            chat_id=chat_id,
+            thread_id=thread_id or "",
+            parent_message_id=parent_id or "",
+            session_summary=summary,
+            current_task_state=TaskState(
+                status="waiting_for_user_confirmation" if proposals else "open",
+                last_user_intent=self._last_user_intent_from_transcript(transcript),
+                last_agent_proposal=proposals,
+                next_action="等待用户回复",
+            ),
+        )
+        # Stash the raw messages on a private attribute for diagnostics
+        # (consumed by the observability line in _inject_session_memory).
+        try:
+            object.__setattr__(
+                memory, "_reconstructed_messages", [m.to_dict() for m in result.messages]
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "[Feishu] Rebuilt session memory from history: tier=%s msgs=%d "
+            "summary_chars=%d proposals=%d",
+            result.tier_used, len(result.messages), len(summary), len(proposals),
+        )
+        return memory
+
+    @staticmethod
+    def _summarise_transcript(transcript: str) -> str:
+        """Compress a transcript into a one-paragraph task summary.
+
+        Heuristic — no LLM call.  Good enough for "Day 2 上下文恢复";
+        the full LLM-driven summary refresh happens after each turn.
+        """
+        if not transcript:
+            return ""
+        lines = [ln for ln in transcript.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        # Keep first 4 + last 6 non-empty lines as a rough context window.
+        keep = lines[:4] + lines[-6:] if len(lines) > 10 else lines
+        joined = "\n".join(keep)
+        if len(joined) > 1200:
+            joined = joined[:1200] + "…"
+        return (
+            "【从飞书历史回填的上下文摘要】\n"
+            "以下为该话题最近的历史要点（来自 Feishu 拉取的 thread/chat 记录），"
+            "用于在新一天开启时恢复任务上下文：\n"
+            f"{joined}"
+        )
+
+    @staticmethod
+    def _extract_proposals_from_transcript(transcript: str) -> list:
+        """Pull the most recent agent proposal bullets from the transcript.
+
+        Heuristic — looks for lines that look like Top-N fixes,
+        "建议", numbered items, etc.  Returns at most 8 items.
+        """
+        if not transcript:
+            return []
+        candidates = []
+        for line in transcript.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            # Look for top-N / 建议 / numbered items
+            lower = text.lower()
+            if any(
+                kw in text for kw in (
+                    "Top ", "TopN", "建议", "方案", "项修复", "项改",
+                    "修复", "1)", "2)", "3)", "1.", "2.", "3.",
+                )
+            ) or lower.startswith(("top ", "1.", "2.", "3.", "1)", "2)", "3)")):
+                # Strip the leading timestamp/sender prefix
+                if "] " in text and text.startswith("["):
+                    text = text.split("] ", 1)[1]
+                if ": " in text:
+                    text = text.split(": ", 1)[1]
+                candidates.append(text)
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        return unique[:8]
+
+    @staticmethod
+    def _last_user_intent_from_transcript(transcript: str) -> str:
+        """Find the last non-bot line in the transcript — best-effort intent."""
+        if not transcript:
+            return ""
+        lines = [ln for ln in transcript.splitlines() if ln.strip()]
+        for line in reversed(lines):
+            if "] BOT:" in line or "] bot:" in line.lower():
+                continue
+            if "] " in line and line.startswith("["):
+                line = line.split("] ", 1)[1]
+            if ": " in line:
+                line = line.split(": ", 1)[1]
+            return line[:300]
+        return ""
+
+    def _format_session_memory_prompt(self, memory) -> str:
+        """Render memory as a system-prompt block.
+
+        The block is intentionally compact and lives in a fenced
+        section so the model can quickly learn "this is session
+        memory, not user message".  Empty fields are omitted to
+        keep the prompt small.
+        """
+        if memory is None:
+            return ""
+        parts = ["<session_memory>"]
+        if memory.topic:
+            parts.append(f"topic: {memory.topic}")
+        if memory.project:
+            parts.append(f"project: {memory.project}")
+        if memory.session_summary:
+            parts.append(f"summary: {memory.session_summary}")
+        ts = memory.current_task_state
+        if ts and (ts.status != "open" or ts.last_user_intent or ts.last_agent_proposal or ts.next_action):
+            parts.append("current_task_state:")
+            parts.append(f"  - status: {ts.status}")
+            if ts.last_user_intent:
+                parts.append(f"  - last_user_intent: {ts.last_user_intent}")
+            for p in (ts.last_agent_proposal or [])[:6]:
+                parts.append(f"  - last_agent_proposal: {p}")
+            if ts.next_action:
+                parts.append(f"  - next_action: {ts.next_action}")
+        if memory.open_todos:
+            parts.append("open_todos:")
+            for t in memory.open_todos[:8]:
+                if isinstance(t, dict):
+                    parts.append(f"  - {t.get('id', '?')}: {t.get('content', '')}")
+                else:
+                    parts.append(f"  - {t}")
+        if memory.important_decisions:
+            parts.append("important_decisions:")
+            for d in memory.important_decisions[:8]:
+                if isinstance(d, dict):
+                    parts.append(f"  - {d.get('id', '?')}: {d.get('content', '')}")
+                else:
+                    parts.append(f"  - {d}")
+        if memory.related_files_or_modules:
+            parts.append("related_files_or_modules:")
+            for f in memory.related_files_or_modules[:6]:
+                parts.append(f"  - {f}")
+        if len(parts) == 1:
+            return ""
+        parts.append("</session_memory>")
+        return "\n".join(parts)
+
+    def _count_recent_inbound_messages(self, event: MessageEvent) -> int:
+        """Best-effort count of recent inbound messages in the same session.
+
+        Looks at the SQLite session store (when available) and falls
+        back to 0.  The exact number is for observability only — the
+        full transcript is loaded by the agent runtime separately.
+        """
+        try:
+            session_key = getattr(event, "_session_key", None) or self._build_session_key(event)
+            from hermes_state import SessionDB  # type: ignore
+            db = SessionDB()
+            return db.count_messages_for_session_key(session_key)
+        except Exception:
+            return 0
+
+    async def _persist_session_memory(
+        self, event: MessageEvent, response: Optional[str] = None,
+    ) -> None:
+        """Refresh session memory after a turn completes.
+
+        Heuristic update — we do not call an LLM to rewrite the
+        summary (that path lives in
+        ``feishu_session_summary_refresher`` once it is wired up);
+        instead we:
+
+          * fold the user message into ``last_user_intent``;
+          * record the agent's response snippet in ``important_decisions``
+            if the response looks like a proposal;
+          * flip the status via :func:`detect_task_status_from_text`.
+
+        If the full LLM-driven refresh is wired up later, this method
+        should call it FIRST and skip the heuristics.
+        """
+        from gateway.session_memory import (
+            TaskState,
+            detect_task_status_from_text,
+            update_session_memory,
+        )
+
+        try:
+            session_key = getattr(event, "_session_key", None) or self._build_session_key(event)
+            memory = getattr(event, "_session_memory", None)
+            if memory is None:
+                from gateway.session_memory import load_session_memory
+                memory = load_session_memory(session_key)
+
+            current_state = (
+                memory.current_task_state
+                if memory is not None
+                else TaskState()
+            )
+            user_text = (event.text or "").strip()
+            agent_text = (response or "").strip()
+
+            new_status = detect_task_status_from_text(
+                user_text=user_text, agent_text=agent_text,
+            )
+            if new_status:
+                current_state = TaskState(
+                    status=new_status,
+                    last_user_intent=user_text or current_state.last_user_intent,
+                    last_agent_proposal=current_state.last_agent_proposal,
+                    next_action=current_state.next_action,
+                )
+
+            # Capture the latest proposal if the response looks like one.
+            proposals_now = list(current_state.last_agent_proposal or [])
+            if agent_text and any(
+                kw in agent_text
+                for kw in ("Top 3", "Top3", "建议", "方案", "项修复", "我会", "可以这么")
+            ):
+                snippets = self._extract_proposals_from_text(agent_text)
+                if snippets:
+                    proposals_now = snippets
+
+            next_action = current_state.next_action
+            if new_status == "in_progress":
+                next_action = "已确认开工，开始按方案执行"
+            elif new_status == "waiting_for_user_confirmation":
+                next_action = "等待用户回复是否开工"
+            elif new_status == "done":
+                next_action = "已完成"
+
+            new_state = TaskState(
+                status=current_state.status,
+                last_user_intent=current_state.last_user_intent or user_text,
+                last_agent_proposal=proposals_now,
+                next_action=next_action,
+            )
+
+            decisions = list(memory.important_decisions if memory else []) or []
+            if new_status == "in_progress":
+                decisions.append({
+                    "id": f"d-{int(datetime.now().timestamp())}",
+                    "content": f"用户确认开工：{user_text[:200]}",
+                    "by": "user",
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                })
+
+            update_session_memory(
+                session_key,
+                platform="feishu",
+                chat_id=getattr(event.source, "chat_id", "") or "",
+                thread_id=getattr(event.source, "thread_id", "") or "",
+                parent_message_id=getattr(event, "reply_to_message_id", "") or "",
+                task_state=new_state,
+                important_decisions=decisions,
+            )
+
+            logger.info(
+                "[Feishu][session] persisted memory session_key=%s status=%s proposals=%d",
+                session_key, new_state.status, len(new_state.last_agent_proposal),
+            )
+        except Exception as e:
+            logger.warning(
+                "[Feishu] Failed to persist session memory: %s", e, exc_info=True,
+            )
+
+    @staticmethod
+    def _extract_proposals_from_text(agent_text: str) -> list:
+        """Pull bullet items from a Top-N / 建议 block in the agent's reply."""
+        if not agent_text:
+            return []
+        out = []
+        for line in agent_text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if (
+                s[:3] in ("1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. ", "8. ")
+                or s[:4] in ("1) ", "2) ", "3) ", "4) ")
+                or s.startswith("- ")
+                or s.startswith("• ")
+            ):
+                cleaned = s.lstrip("0123456789.)-• \t").strip()
+                if cleaned:
+                    out.append(cleaned[:200])
+        return out[:8]
 
     # =========================================================================
     # Webhook server and security
@@ -3087,6 +3654,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
+        config_extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        channel_prompt = resolve_channel_prompt(config_extra, chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
         source = self.build_source(
             chat_id=chat_id,
@@ -3108,6 +3677,7 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            channel_prompt=channel_prompt,
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3539,7 +4109,13 @@ class FeishuAdapter(BasePlatformAdapter):
         raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
         message_id = str(getattr(message, "message_id", "") or "")
-        logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
+        logger.info(
+            "[Feishu] Normalizing raw message type=%s message_id=%s chat_id=%s chat_type=%s",
+            raw_type,
+            message_id,
+            getattr(message, "chat_id", "") or "",
+            getattr(message, "chat_type", "p2p") or "p2p",
+        )
 
         normalized = normalize_feishu_message(
             message_type=raw_type,

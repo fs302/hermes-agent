@@ -47,7 +47,9 @@ class DummyTelegramAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         self.processing_hooks.append(("start", event.message_id))
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome, response=None,
+    ) -> None:
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 

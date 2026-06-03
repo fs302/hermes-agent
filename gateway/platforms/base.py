@@ -3211,8 +3211,18 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Hook called when background processing completes."""
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome,
+        response: Optional[str] = None,
+    ) -> None:
+        """Hook called when background processing completes.
+
+        Adapters that maintain per-session state (e.g. a thread-aware
+        summary) override this and read ``response`` — the final text
+        the agent emitted for the turn — to refresh that state.  The
+        base implementation ignores the new ``response`` kwarg so
+        existing adapters keep working unchanged.
+        """
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
@@ -4002,6 +4012,11 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 delivery_succeeded = True
 
+        # Initialise `response` up-front so the cancel/exception paths
+        # can pass it to on_processing_complete without an UnboundLocalError
+        # if the handler is cancelled before the assignment below.
+        response: Optional[str] = None
+
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
         # Fall back to a new Event only if the entry was removed externally.
@@ -4342,6 +4357,7 @@ class BasePlatformAdapter(ABC):
                 "on_processing_complete",
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                response=response,
             )
 
             # The active drain owns debounce state. If a queue-mode timer has
@@ -4393,10 +4409,14 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await self._run_processing_hook("on_processing_complete", event, outcome)
+            await self._run_processing_hook(
+                "on_processing_complete", event, outcome, response=response,
+            )
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            await self._run_processing_hook(
+                "on_processing_complete", event, ProcessingOutcome.FAILURE,
+            )
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:

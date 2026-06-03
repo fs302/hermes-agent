@@ -1655,9 +1655,11 @@ class SlackAdapter(BasePlatformAdapter):
         if channel_id:
             await self._add_reaction(channel_id, ts, "eyes")
 
-    async def on_processing_complete(
-        self, event: MessageEvent, outcome: ProcessingOutcome
-    ) -> None:
+<<<<<<< HEAD
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome, response: Optional[str] = None) -> None:
+=======
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome, response: Optional[str] = None) -> None:
+>>>>>>> fe72f8833 (feat(feishu): persistent topic-scoped session memory)
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return

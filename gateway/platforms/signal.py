@@ -1492,7 +1492,7 @@ class SignalAdapter(BasePlatformAdapter):
         if target:
             await self.send_reaction(event.source.chat_id, "👀", *target)
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: "ProcessingOutcome") -> None:
+    async def on_processing_complete(self, event: MessageEvent, outcome: "ProcessingOutcome", response: Optional[str] = None) -> None:
         """Swap the 👀 reaction for ✅ (success) or ❌ (failure).
 
         On CANCELLED we leave the 👀 in place — no terminal outcome means
