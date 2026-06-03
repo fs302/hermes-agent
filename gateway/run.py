@@ -14275,9 +14275,11 @@ class GatewayRunner:
 
         # BOSS spec: also surface gateway.llm_call_logs aggregation so
         # the user can see per-model / per-provider breakdown across
-        # the whole session.  Falls through to a generic no-data
-        # message when llm_call_logs has no rows AND no agent
-        # account snapshot was available.
+        # the whole session.  This block is ALWAYS reached when there
+        # is no in-memory agent (between turns / fresh restart) and no
+        # account snapshot — so we render the aggregation even when
+        # total_requests=0, instead of falling through to the generic
+        # "No usage data available" message.
         try:
             from gateway.llm_call_logs import aggregate_by_period
             _usage_args = event.get_command_args().strip().lower()
@@ -14298,21 +14300,30 @@ class GatewayRunner:
                 _agg = aggregate_by_period(period="7d")
             else:
                 _agg = aggregate_by_period(period="today")
-            if _agg.get("total_requests", 0) > 0:
-                _label = {
-                    "today": "今天", "7d": "过去 7 天",
-                    "session": "本 session 最近 24h",
-                    "all": "全量",
-                }.get(_usage_period, _usage_period)
-                _lines: list[str] = [
-                    f"📈 **Usage — {_label}**",
-                    "",
-                    f"requests:    {_agg['total_requests']}",
-                    f"input:       {_agg['total_input_tokens']:,}",
-                    f"output:      {_agg['total_output_tokens']:,}",
-                    f"total:       {_agg['total_tokens']:,}",
-                    f"cost (USD):  ${_agg['estimated_cost_usd']:.4f}",
-                ]
+            _label = {
+                "today": "今天", "7d": "过去 7 天",
+                "session": "本 session 最近 24h",
+                "all": "全量",
+            }.get(_usage_period, _usage_period)
+            _lines: list[str] = [f"📈 **Usage — {_label}**", ""]
+            if _agg.get("total_requests", 0) == 0:
+                _lines.append("  (尚无 LLM 调用记录)")
+            else:
+                _lines.append(
+                    f"requests:    {_agg['total_requests']}"
+                )
+                _lines.append(
+                    f"input:       {_agg['total_input_tokens']:,}"
+                )
+                _lines.append(
+                    f"output:      {_agg['total_output_tokens']:,}"
+                )
+                _lines.append(
+                    f"total:       {_agg['total_tokens']:,}"
+                )
+                _lines.append(
+                    f"cost (USD):  ${_agg['estimated_cost_usd']:.4f}"
+                )
                 for row in _agg.get("by_model", []):
                     _lines.append(
                         f"  • model: `{row.get('model') or '—'}`  "
@@ -14327,7 +14338,7 @@ class GatewayRunner:
                         f"requests: {row.get('requests', 0)}  "
                         f"tokens: {row.get('total_tokens', 0):,}"
                     )
-                return "\n".join(_lines)
+            return "\n".join(_lines)
         except Exception as _usage_err:
             logger.debug("llm_call_logs aggregate failed: %s", _usage_err)
 
