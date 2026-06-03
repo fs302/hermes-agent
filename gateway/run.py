@@ -1570,6 +1570,28 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _resolve_footer_provider(
+    agent_result: dict | None,
+    session_override: dict | None = None,
+    runtime_provider: str | None = None,
+) -> str:
+    """Return the provider label that best matches the current turn.
+
+    Priority is:
+    1. The provider reported by the just-finished agent turn
+    2. Any active session-level model override
+    3. The gateway runtime default provider
+    """
+    for candidate in (
+        (agent_result or {}).get("provider"),
+        (session_override or {}).get("provider"),
+        runtime_provider,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -8114,6 +8136,9 @@ class GatewayRunner:
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
+        if canonical == "usage":
+            return await self._handle_usage_command(event)
+
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
@@ -9488,10 +9513,18 @@ class GatewayRunner:
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                _footer_runtime = _resolve_runtime_agent_kwargs()
+                _footer_provider = _resolve_footer_provider(
+                    agent_result,
+                    self._session_model_overrides.get(session_key, {}),
+                    _footer_runtime.get("provider"),
+                )
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
+                    agent="main",
                     model=agent_result.get("model"),
+                    provider=_footer_provider,
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
@@ -9738,9 +9771,25 @@ class GatewayRunner:
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
+                # Feishu rich replies should keep the footer inside the same
+                # card bubble, so do a final edit on the streamed message when
+                # we still have an editable message id. Other platforms keep the
+                # older trailing-send behavior.
+                if _footer_line and source.platform == Platform.FEISHU:
+                    try:
+                        _foot_adapter = self.adapters.get(source.platform)
+                        _sc = stream_consumer_holder[0]
+                        _message_id = getattr(_sc, "message_id", None) if _sc else None
+                        if _foot_adapter and _message_id and _message_id != "__no_edit__":
+                            await _foot_adapter.edit_message(
+                                source.chat_id,
+                                _message_id,
+                                f"{response}\n\n{_footer_line}",
+                                finalize=True,
+                            )
+                    except Exception as _e:
+                        logger.debug("feishu streamed footer edit failed: %s", _e)
+                elif _footer_line:
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
@@ -10875,6 +10924,7 @@ class GatewayRunner:
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model status                       — show current model + recent calls
         """
         import yaml
         from hermes_cli.model_switch import (
@@ -10885,6 +10935,12 @@ class GatewayRunner:
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
+
+        # Subcommand: /model status — show current + recent LLM calls.
+        # Parsed BEFORE parse_model_flags so it does not get chewed up
+        # by the --provider / --global flag parser.
+        if raw_args.lower().split()[:1] == ["status"]:
+            return self._handle_model_status_command(event)
 
         # Parse --provider, --global, and --refresh flags
         model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
@@ -11187,6 +11243,46 @@ class GatewayRunner:
             "api_mode": result.api_mode,
         }
 
+        # Persist the override to session_memory so Day-2 sessions
+        # continue using the model the user picked (per BOSS spec).
+        # Bounded try/except — persistence is best-effort.
+        try:
+            from gateway.session_model_config import (
+                SessionModelConfig,
+                set_session_model_config,
+            )
+            import time as _t
+            set_session_model_config(
+                session_key,
+                SessionModelConfig(
+                    model=result.new_model,
+                    provider=result.target_provider or "",
+                    base_url=result.base_url or "",
+                    api_key=result.api_key or "",
+                    api_mode=result.api_mode or "",
+                    requested_at=_t.time(),
+                ),
+            )
+        except Exception as _persist_err:
+            logger.warning(
+                "Failed to persist session_model_config for %s: %s",
+                session_key, _persist_err,
+            )
+
+        # Invalidate the model resolver cache so the next LLM call
+        # re-resolves and immediately picks up the new model — this
+        # is what makes /model actually take effect on the next turn.
+        try:
+            from gateway.model_resolver import invalidate_model_resolver_cache
+            invalidate_model_resolver_cache(
+                session_key=session_key,
+                agent_name="main",
+            )
+        except Exception as _inv_err:
+            logger.warning(
+                "Failed to invalidate model_resolver cache: %s", _inv_err,
+            )
+
         # Evict cached agent so the next turn creates a fresh agent from the
         # override rather than relying on cache signature mismatch detection.
         self._evict_cached_agent(session_key)
@@ -11322,6 +11418,213 @@ class GatewayRunner:
 
         prefix = "✓" if result.success else "✗"
         return f"{prefix} {result.message}"
+
+    def _handle_model_status_command(self, event: MessageEvent) -> str:
+        """Render the /model status subcommand output.
+
+        Shows the current session_key, the configured model, the
+        last-5 LLM call records from gateway.llm_call_logs, and a
+        warning when requested/resolved/actual disagree.  Used by
+        the BOSS to answer "did the /model switch actually take?"
+        without grepping logs.
+        """
+        from agent.i18n import t as _t
+        from gateway.llm_call_logs import query_recent
+        from gateway.session_model_config import get_session_model_config
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        # Resolve model layers in priority order so the user can see
+        # which level is currently winning.
+        # Pull from memory first, then from the in-memory override,
+        # then from config.
+        session_cfg = get_session_model_config(session_key)
+        memory_override = (
+            session_cfg.to_dict() if session_cfg is not None else {}
+        )
+        runtime_override = self._session_model_overrides.get(session_key, {})
+
+        # Config defaults
+        cfg_model = ""
+        cfg_provider = ""
+        try:
+            cfg = _load_gateway_config()
+            if cfg:
+                model_cfg = cfg.get("model", {}) or {}
+                if isinstance(model_cfg, dict):
+                    cfg_model = str(model_cfg.get("default", "") or "")
+                    cfg_provider = str(model_cfg.get("provider", "") or "")
+        except Exception:
+            pass
+
+        # Effective model = session > user default
+        eff_model = (
+            runtime_override.get("model")
+            or memory_override.get("model")
+            or cfg_model
+        )
+        eff_provider = (
+            runtime_override.get("provider")
+            or memory_override.get("provider")
+            or cfg_provider
+        )
+
+        lines: List[str] = []
+        lines.append("📊 **Model Status**")
+        lines.append("")
+        lines.append(f"Session Key: `{session_key}`")
+        lines.append(f"Agent: `main`")
+        lines.append("")
+        lines.append("**Model layers (priority order):**")
+        lines.append(
+            f"  session_model:    "
+            f"`{memory_override.get('model') or '—'}`"
+        )
+        lines.append(
+            f"  user default:     "
+            f"`{cfg_model or '—'}`"
+        )
+        lines.append(
+            f"  agent default:    "
+            f"`(from agent config)`"
+        )
+        lines.append("")
+        lines.append(
+            f"**Effective now:** `{eff_model}` "
+            f"(`{eff_provider}`)"
+        )
+        lines.append("")
+        lines.append("**Last 5 LLM calls** (newest first):")
+        recent = query_recent(session_key=session_key, limit=5)
+        if not recent:
+            lines.append("  (no calls recorded yet for this session)")
+        else:
+            for r in recent:
+                ts = float(r.get("created_at") or 0)
+                ts_str = (
+                    datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                    if ts else "??:??:??"
+                )
+                req = r.get("requested_model") or "—"
+                res = r.get("resolved_model") or "—"
+                act = r.get("actual_model") or "—"
+                act_prov = r.get("actual_provider") or "—"
+                fb = bool(r.get("fallback_used"))
+                err = r.get("error_message") or ""
+                status = r.get("status") or "ok"
+                warning = ""
+                # BOSS rule: requested/resolved/actual must be flagged
+                # if they disagree.  Fallback is a known cause but the
+                # user wants the warning regardless.
+                if (req and res and req != res) or (req and act and req != act) \
+                        or (res and act and res != act):
+                    warning = " ⚠️ requested≠resolved≠actual"
+                fb_marker = " 🔁fallback" if fb else ""
+                err_marker = f" ❌{err[:60]}" if err else ""
+                lines.append(
+                    f"  • {ts_str}  req=`{req}`  res=`{res}`  "
+                    f"actual=`{act}` ({act_prov})"
+                    f"{fb_marker}{warning}{err_marker}"
+                )
+        lines.append("")
+        lines.append(
+            "💡 Final生效以最近一次 `actual_model` 为准。"
+        )
+        return "\n".join(lines)
+
+    def _handle_usage_command(self, event: MessageEvent) -> str:
+        """Render the /usage subcommand output.
+
+        Supports:
+          /usage                — same as /usage today
+          /usage today          — today's calls (local-day start)
+          /usage 7d             — last 7 days
+          /usage session        — last 24h within this session_key
+          /usage model          — all-time, by model breakdown
+
+        Reads :func:`gateway.llm_call_logs.aggregate_by_period`.
+        """
+        from agent.i18n import t as _t
+        from gateway.llm_call_logs import aggregate_by_period
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        args = event.get_command_args().strip().lower()
+        period = args.split()[0] if args else "today"
+        if period not in ("today", "7d", "session", "model", "all"):
+            period = "today"
+
+        # "model" = full breakdown; otherwise use the period for the
+        # totals + by_model / by_provider / by_agent breakdown
+        if period == "model":
+            agg = aggregate_by_period(period="all")
+        elif period == "session":
+            agg = aggregate_by_period(period="session", session_key=session_key)
+        elif period == "7d":
+            agg = aggregate_by_period(period="7d")
+        elif period == "all":
+            agg = aggregate_by_period(period="all")
+        else:
+            agg = aggregate_by_period(period="today")
+
+        lines: List[str] = []
+        period_label = {
+            "today": "今天", "7d": "过去 7 天",
+            "session": "本 session 最近 24h",
+            "model": "全量（按 model 明细）",
+            "all": "全量",
+        }.get(period, period)
+        lines.append(f"📈 **Usage — {period_label}**")
+        lines.append("")
+        if agg["total_requests"] == 0:
+            lines.append("  (尚无记录)")
+            return "\n".join(lines)
+        lines.append(
+            f"requests:    {agg['total_requests']}"
+        )
+        lines.append(
+            f"input:       {agg['total_input_tokens']:,}"
+        )
+        lines.append(
+            f"output:      {agg['total_output_tokens']:,}"
+        )
+        lines.append(
+            f"total:       {agg['total_tokens']:,}"
+        )
+        lines.append(
+            f"cost (USD):  ${agg['estimated_cost_usd']:.4f}"
+        )
+        if agg["by_model"]:
+            lines.append("")
+            lines.append("**by_model:**")
+            for row in agg["by_model"]:
+                lines.append(
+                    f"  • model: `{row.get('model') or '—'}`  "
+                    f"provider: `{row.get('provider') or '—'}`  "
+                    f"requests: {row.get('requests', 0)}  "
+                    f"tokens: {row.get('total_tokens', 0):,}  "
+                    f"cost: ${float(row.get('cost', 0) or 0):.4f}"
+                )
+        if agg["by_provider"]:
+            lines.append("")
+            lines.append("**by_provider:**")
+            for row in agg["by_provider"]:
+                lines.append(
+                    f"  • `{row.get('provider') or '—'}`  "
+                    f"requests: {row.get('requests', 0)}  "
+                    f"tokens: {row.get('total_tokens', 0):,}"
+                )
+        if agg["by_agent"]:
+            lines.append("")
+            lines.append("**by_agent:**")
+            for row in agg["by_agent"]:
+                lines.append(
+                    f"  • `{row.get('agent_name') or '—'}`  "
+                    f"requests: {row.get('requests', 0)}  "
+                    f"tokens: {row.get('total_tokens', 0):,}"
+                )
+        return "\n".join(lines)
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
@@ -12553,6 +12856,28 @@ class GatewayRunner:
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
+            # BOSS spec: if the agent fell back to a different model
+            # during this turn, append a transparency notice so the
+            # user knows which model they asked for vs. which served
+            # them.  This is the user-facing half of the
+            # ``llm_call_logs.fallback_used=true`` row.
+            try:
+                fb_info = getattr(agent, "_last_fallback_info", None)
+                if fb_info and (time.time() - float(fb_info.get("at", 0))) < 600:
+                    original = fb_info.get("original_model") or "?"
+                    fallback_model = fb_info.get("fallback_model") or "?"
+                    reason = fb_info.get("reason") or "provider failure"
+                    # Only append once per turn — check the tail.
+                    notice = (
+                        f"\n\n⚠️ 本次请求从 `{original}` fallback 到 "
+                        f"`{fallback_model}`，原因是 `{reason}`。"
+                    )
+                    tail_marker = "⚠️ 本次请求从"
+                    if isinstance(response, str) and tail_marker not in response:
+                        response = response + notice
+            except Exception as _fb_err:
+                logger.debug("Fallback notice append failed: %s", _fb_err)
+
             # Extract media files from the response
             if response:
                 media_files, response = adapter.extract_media(response)
@@ -12967,6 +13292,7 @@ class GatewayRunner:
             # Show a preview using current agent state if available.
             from gateway.runtime_footer import format_runtime_footer
             preview = format_runtime_footer(
+                agent="main",
                 model=_resolve_gateway_model(user_config) or None,
                 context_tokens=0,
                 context_length=None,

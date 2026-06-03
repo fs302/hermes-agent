@@ -3477,10 +3477,99 @@ class AIAgent:
                 drop_context_1m_beta=_drop_1m,
             )
 
+    def _emit_llm_call_log(
+        self,
+        status: str = "ok",
+        error_message: str = "",
+    ) -> None:
+        """Write one row to gateway.llm_call_logs for the just-finished call.
+
+        Pulls session context + actual model + tokens from self.
+        Best-effort: any failure is swallowed and logged at debug level;
+        the caller MUST NOT see exceptions from this method.
+
+        Called from the wrapped forwarders of _interruptible_api_call and
+        _interruptible_streaming_api_call (so the implementation can move
+        between helper modules without losing observability).
+        """
+        try:
+            from gateway.llm_call_logs import (
+                record_call, LLMCallRecord,
+                _extract_usage as _ext_u,
+                _extract_actual_model as _ext_m,
+            )
+        except Exception:
+            return
+        try:
+            last = getattr(self, "_last_response", None)
+            actual_model = _ext_m(last) or str(getattr(self, "model", "") or "")
+            actual_provider = str(getattr(self, "provider", "") or "") or None
+            inp, out, tot, cache_hit, cache_read, cache_write = _ext_u(last)
+            rec = LLMCallRecord(
+                session_key=str(getattr(self, "_last_session_key", "") or ""),
+                user_id=str(getattr(self, "_last_user_id", "") or "") or None,
+                chat_id=str(getattr(self, "_last_chat_id", "") or "") or None,
+                thread_id=str(getattr(self, "_last_thread_id", "") or "") or None,
+                agent_name=str(getattr(self, "agent_name", "") or "main") or "main",
+                requested_model=str(getattr(self, "_last_requested_model", "") or ""),
+                requested_provider=str(getattr(self, "_last_requested_provider", "") or "") or None,
+                resolved_model=str(getattr(self, "model", "") or ""),
+                resolved_provider=actual_provider,
+                actual_model=actual_model,
+                actual_provider=actual_provider,
+                model_resolution_source=str(
+                    getattr(self, "_last_resolution_source", "") or "system_default"
+                ),
+                input_tokens=int(inp or 0),
+                output_tokens=int(out or 0),
+                total_tokens=int(tot or 0),
+                cache_hit=bool(cache_hit),
+                cache_read_tokens=int(cache_read or 0),
+                cache_write_tokens=int(cache_write or 0),
+                latency_ms=int(getattr(self, "_last_latency_ms", 0) or 0),
+                status=str(status or "ok"),
+                error_message=str(error_message or "")[:200] or None,
+                fallback_used=bool(getattr(self, "_fallback_activated", False)),
+                fallback_reason=str(
+                    getattr(self, "_last_fallback_reason", "") or ""
+                ) or None,
+            )
+            record_call(rec)
+        except Exception as _emit_err:
+            try:
+                import logging as _lg
+                _lg.getLogger(__name__).debug(
+                    "_emit_llm_call_log failed: %s", _emit_err,
+                )
+            except Exception:
+                pass
+
     def _interruptible_api_call(self, api_kwargs: dict):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
+        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``.
+
+        Wrapped at this layer so we can capture the gateway.llm_call_logs
+        row from a single exit point, even when the implementation moves
+        between helper modules.  Failures of the instrumentation never
+        propagate to the caller (best-effort, see _emit_llm_call_log).
+        """
         from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
+        start = time.time() if "time" in globals() else 0
+        try:
+            response = interruptible_api_call(self, api_kwargs)
+        except Exception as _e:
+            try:
+                self._emit_llm_call_log(status="error", error_message=str(_e)[:200])
+            except Exception:
+                pass
+            raise
+        try:
+            self._emit_llm_call_log(
+                status="ok",
+                latency_ms=int((time.time() - start) * 1000) if start else 0,
+            )
+        except Exception:
+            pass
+        return response
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -3651,14 +3740,63 @@ class AIAgent:
     def _interruptible_streaming_api_call(
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
+        """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``.
+
+        Wrapped at this layer so gateway.llm_call_logs captures one row
+        per call even though the implementation is in a helper module.
+        """
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+        start = time.time() if "time" in globals() else 0
+        try:
+            response = interruptible_streaming_api_call(
+                self, api_kwargs, on_first_delta=on_first_delta,
+            )
+        except Exception as _e:
+            try:
+                self._emit_llm_call_log(status="error", error_message=str(_e)[:200])
+            except Exception:
+                pass
+            raise
+        try:
+            self._emit_llm_call_log(
+                status="ok",
+                latency_ms=int((time.time() - start) * 1000) if start else 0,
+            )
+        except Exception:
+            pass
+        return response
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
-        """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
+        """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``.
+
+        Captures ``_last_fallback_info`` here so the gateway can render a
+        user-visible transparency notice on the next turn.
+        """
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        activated_before = bool(getattr(self, "_fallback_activated", False))
+        result = try_activate_fallback(self, reason)
+        if result and not activated_before and bool(getattr(self, "_fallback_activated", False)):
+            try:
+                primary = (getattr(self, "_primary_runtime", None) or {})
+                original = str(
+                    primary.get("model", "")
+                    or getattr(self, "_last_fallback_original", "")
+                    or ""
+                )
+                if not original and getattr(self, "_fallback_chain", None):
+                    try:
+                        original = str(self._fallback_chain[0].get("model", "") or "")
+                    except Exception:
+                        original = ""
+                self._last_fallback_info = {
+                    "original_model": original,
+                    "fallback_model": str(getattr(self, "model", "") or ""),
+                    "reason": str(reason) if reason is not None else "fallback activated",
+                    "at": time.time(),
+                }
+            except Exception:
+                pass
+        return result
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.

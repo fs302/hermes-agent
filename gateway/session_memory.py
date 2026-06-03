@@ -131,6 +131,9 @@ class SessionMemory:
     open_todos: List[Dict[str, Any]] = field(default_factory=list)
     important_decisions: List[Dict[str, Any]] = field(default_factory=list)
     related_files_or_modules: List[str] = field(default_factory=list)
+    # Per-session model override (written by /model command).
+    # Empty dict means "no override" — falls through to user/agent default.
+    model_config: Dict[str, Any] = field(default_factory=dict)
     updated_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -147,6 +150,7 @@ class SessionMemory:
             "open_todos": list(self.open_todos),
             "important_decisions": list(self.important_decisions),
             "related_files_or_modules": list(self.related_files_or_modules),
+            "model_config": dict(self.model_config),
             "updated_at": self.updated_at,
         }
 
@@ -168,6 +172,7 @@ class SessionMemory:
             related_files_or_modules=list(
                 data.get("related_files_or_modules", []) or []
             ),
+            model_config=dict(data.get("model_config", {}) or {}),
             updated_at=str(data.get("updated_at", "") or ""),
         )
 
@@ -335,6 +340,7 @@ def update_session_memory(
     open_todos: Optional[List[Dict[str, Any]]] = None,
     important_decisions: Optional[List[Dict[str, Any]]] = None,
     related_files_or_modules: Optional[List[str]] = None,
+    model_config: Optional[Dict[str, Any]] = None,
 ) -> SessionMemory:
     """Patch the memory for *session_key* in place.
 
@@ -371,6 +377,8 @@ def update_session_memory(
         memory.important_decisions = important_decisions
     if related_files_or_modules is not None:
         memory.related_files_or_modules = related_files_or_modules
+    if model_config is not None:
+        memory.model_config = dict(model_config)
 
     save_session_memory(memory)
     return memory
