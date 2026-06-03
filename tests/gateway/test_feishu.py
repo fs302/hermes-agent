@@ -374,7 +374,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
+    def test_edit_message_falls_back_to_text_when_interactive_update_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -409,7 +409,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2538,110 +2538,6 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_inline_markdown(self):
-        from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = {}
-
-        class _MessageAPI:
-            def create(self, request):
-                captured["request"] = request
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(message_id="om_markdown"),
-                )
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-            result = asyncio.run(
-                adapter.send(
-                    chat_id="oc_chat",
-                    content="可以用 **粗体** 和 *斜体*。",
-                )
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        elements = payload["zh_cn"]["content"][0]
-        self.assertEqual(elements, [{"tag": "md", "text": "可以用 **粗体** 和 *斜体*。"}])
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_send_splits_fenced_code_blocks_into_separate_post_rows(self):
-        from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = {}
-
-        class _MessageAPI:
-            def create(self, request):
-                captured["request"] = request
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(message_id="om_codeblock"),
-                )
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        content = (
-            "确认已入库 ✓\n"
-            "文件路径：`/root/.hermes/profiles/agent_cto/cron/jobs.json`\n"
-            "**解码后的内容：**\n"
-            "```json\n"
-            '{"cron": "list"}\n'
-            "```\n"
-            "后续说明仍应保留。"
-        )
-
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-            result = asyncio.run(
-                adapter.send(
-                    chat_id="oc_chat",
-                    content=content,
-                )
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [
-                [
-                    {
-                        "tag": "md",
-                        "text": "确认已入库 ✓\n文件路径：`/root/.hermes/profiles/agent_cto/cron/jobs.json`\n**解码后的内容：**",
-                    }
-                ],
-                [{"tag": "md", "text": "```json\n{\"cron\": \"list\"}\n```"}],
-                [{"tag": "md", "text": "后续说明仍应保留。"}],
-            ],
-        )
-
-    @patch.dict(os.environ, {}, clear=True)
     def test_build_post_payload_keeps_fence_like_code_lines_inside_code_block(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2707,7 +2603,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_text_when_post_payload_is_rejected(self):
+    def test_send_falls_back_to_text_when_interactive_payload_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2744,7 +2640,7 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2752,7 +2648,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_text_when_post_response_is_unsuccessful(self):
+    def test_send_falls_back_to_text_when_interactive_response_is_unsuccessful(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2789,57 +2685,12 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_advanced_markdown_lines(self):
-        from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = {}
-
-        class _MessageAPI:
-            def create(self, request):
-                captured["request"] = request
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(message_id="om_markdown_advanced"),
-                )
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
-            result = asyncio.run(
-                adapter.send(
-                    chat_id="oc_chat",
-                    content="---\n1. 第一项\n<u>下划线</u>\n~~删除线~~",
-                )
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
-        )
-
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestHydrateBotIdentity(unittest.TestCase):

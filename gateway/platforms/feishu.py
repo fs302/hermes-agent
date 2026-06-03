@@ -155,14 +155,23 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 # Detect markdown tables: a line starting with | followed by a separator line.
-# Feishu post-type 'md' elements do not render tables, so we force text mode.
+# Feishu post-type 'md' elements do not render tables, so we route these
+# through CardKit's native table component.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
+_RUNTIME_FOOTER_LINE_RE = re.compile(
+    r"^\s*(?:Agent|Model|Provider|Context|CWD):.+(?:\s\|\s(?:Agent|Model|Provider|Context|CWD):.+)+\s*$"
+)
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_PAYLOAD_FIELD_INVALID_RE = re.compile(
+    r"(content format of the post type is incorrect|field validation failed)",
+    re.IGNORECASE,
+)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -607,6 +616,205 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+def _build_markdown_card_payload(content: str) -> str:
+    """Build a Feishu CardKit v2 payload for rich replies.
+
+    Feishu post ``md`` elements have poor table support; CardKit v2 supports a
+    native table component and richer markdown rendering.
+    """
+    elements = _build_card_elements(content)
+    if not elements:
+        elements = [{"tag": "markdown", "content": content or " "}]
+    card = {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": True,
+        },
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "Hermes"},
+        },
+        "body": {"elements": elements},
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+def _build_card_elements(content: str) -> List[Dict[str, Any]]:
+    elements: List[Dict[str, Any]] = []
+    footer_note = _extract_runtime_footer_note(content)
+    if footer_note:
+        content = footer_note["content"]
+    pending_markdown: List[str] = []
+    table_index = 1
+    lines = content.splitlines()
+    i = 0
+
+    def _flush_markdown() -> None:
+        nonlocal pending_markdown
+        text = "\n".join(pending_markdown).strip()
+        if text:
+            elements.append({"tag": "markdown", "content": text})
+        pending_markdown = []
+
+    while i < len(lines):
+        if _looks_like_markdown_table_at(lines, i):
+            table_lines = [lines[i], lines[i + 1]]
+            i += 2
+            while i < len(lines) and _is_markdown_table_row(lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            table = _build_table_card_element(table_lines, table_index)
+            if table is not None:
+                _flush_markdown()
+                elements.append(table)
+                table_index += 1
+                continue
+            pending_markdown.extend(table_lines)
+            continue
+        pending_markdown.append(lines[i])
+        i += 1
+
+    _flush_markdown()
+    if footer_note and footer_note["footer"]:
+        if elements:
+            elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": footer_note["footer"]})
+    return elements
+
+
+def _extract_runtime_footer_note(content: str) -> Optional[Dict[str, str]]:
+    stripped = (content or "").rstrip()
+    if not stripped:
+        return None
+    body, sep, tail = stripped.rpartition("\n\n")
+    if not sep:
+        return None
+    footer = tail.strip()
+    if not _RUNTIME_FOOTER_LINE_RE.match(footer):
+        return None
+    return {
+        "content": body.rstrip(),
+        "footer": footer,
+    }
+
+
+def _format_post_text_with_runtime_footer(content: str) -> str:
+    footer_note = _extract_runtime_footer_note(content)
+    if not footer_note:
+        return content
+    body = footer_note["content"].strip()
+    footer = footer_note["footer"]
+    if not body:
+        return footer
+    return f"{body}\n\n---\n{footer}"
+
+
+def _looks_like_markdown_table_at(lines: Sequence[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and _is_markdown_table_row(lines[index])
+        and bool(_MARKDOWN_TABLE_SEPARATOR_RE.match(lines[index + 1]))
+    )
+
+
+def _is_markdown_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped and "|" in stripped)
+
+
+def _split_markdown_table_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells: List[str] = []
+    current: List[str] = []
+    escaped = False
+    for char in stripped:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "|":
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    cells.append("".join(current).strip())
+    return cells
+
+
+def _card_table_column_name(label: str, index: int, seen: set[str]) -> str:
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", label.strip().lower()).strip("_")
+    if not base or not base[0].isalpha():
+        base = f"col_{index + 1}"
+    name = base[:24]
+    candidate = name
+    suffix = 2
+    while candidate in seen:
+        tail = f"_{suffix}"
+        candidate = f"{name[:24 - len(tail)]}{tail}"
+        suffix += 1
+    seen.add(candidate)
+    return candidate
+
+
+def _build_table_card_element(table_lines: Sequence[str], table_index: int) -> Optional[Dict[str, Any]]:
+    if len(table_lines) < 3:
+        return None
+    headers = _split_markdown_table_row(table_lines[0])
+    if not headers:
+        return None
+
+    seen: set[str] = set()
+    columns = []
+    names = []
+    for idx, header in enumerate(headers):
+        name = _card_table_column_name(header, idx, seen)
+        names.append(name)
+        columns.append(
+            {
+                "name": name,
+                "display_name": header or f"Column {idx + 1}",
+                "data_type": "text",
+                "width": "auto",
+            }
+        )
+
+    rows = []
+    for raw_line in table_lines[2:]:
+        cells = _split_markdown_table_row(raw_line)
+        row = {}
+        for idx, name in enumerate(names):
+            row[name] = cells[idx] if idx < len(cells) else ""
+        rows.append(row)
+
+    if not rows:
+        return None
+    return {
+        "tag": "table",
+        "element_id": f"table_{table_index}",
+        "page_size": min(10, max(1, len(rows))),
+        "row_height": "auto",
+        "freeze_first_column": len(columns) > 2,
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "none",
+            "text_color": "grey",
+            "bold": True,
+            "lines": 1,
+        },
+        "columns": columns,
+        "rows": rows,
+    }
 
 
 def parse_feishu_post_payload(
@@ -1792,9 +2000,9 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    if msg_type not in {"post", "interactive"} or not _PAYLOAD_FIELD_INVALID_RE.search(str(exc)):
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    logger.warning("[Feishu] Invalid %s payload rejected by API; falling back to plain text", msg_type)
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
@@ -1803,11 +2011,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 if (
-                    msg_type == "post"
+                    msg_type in {"post", "interactive"}
                     and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    and _PAYLOAD_FIELD_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
                 ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    logger.warning("[Feishu] %s payload rejected by API response; falling back to plain text", msg_type)
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
@@ -1841,8 +2049,12 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await asyncio.to_thread(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
+            if (
+                not result.success
+                and msg_type in {"post", "interactive"}
+                and _PAYLOAD_FIELD_INVALID_RE.search(result.error or "")
+            ):
+                logger.warning("[Feishu] Invalid %s update payload rejected by API; falling back to plain text", msg_type)
                 fallback_body = self._build_update_message_body(
                     msg_type="text",
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
@@ -2410,16 +2622,33 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = getattr(message, "message_id", None)
+        chat_id = getattr(message, "chat_id", "") or ""
+        chat_type = getattr(message, "chat_type", "p2p") or "p2p"
+        raw_type = getattr(message, "message_type", "") or ""
+        logger.info(
+            "[Feishu] Received raw message type=%s message_id=%s chat_id=%s chat_type=%s",
+            raw_type,
+            message_id,
+            chat_id,
+            chat_type,
+        )
         if not message_id or self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
         reason = self._admit(sender, message)
         if reason is not None:
-            logger.debug("[Feishu] dropping inbound event: %s", reason)
+            logger.info(
+                "[Feishu] Dropping inbound event: reason=%s chat_id=%s chat_type=%s "
+                "require_mention=%s sender_type=%s",
+                reason,
+                chat_id,
+                chat_type,
+                self._require_mention_for(chat_id) if chat_type != "p2p" else False,
+                getattr(sender, "sender_type", ""),
+            )
             return
 
-        chat_type = getattr(message, "chat_type", "p2p")
         await self._process_inbound_message(
             data=data,
             message=message,
@@ -3539,7 +3768,13 @@ class FeishuAdapter(BasePlatformAdapter):
         raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
         message_id = str(getattr(message, "message_id", "") or "")
-        logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
+        logger.info(
+            "[Feishu] Normalizing raw message type=%s message_id=%s chat_id=%s chat_type=%s",
+            raw_type,
+            message_id,
+            getattr(message, "chat_id", "") or "",
+            getattr(message, "chat_type", "p2p") or "p2p",
+        )
 
         normalized = normalize_feishu_message(
             message_type=raw_type,
@@ -4308,14 +4543,10 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
+        if _extract_runtime_footer_note(content) and not _MARKDOWN_TABLE_RE.search(content):
+            return "post", _build_markdown_post_payload(_format_post_text_with_runtime_footer(content))
+        if _MARKDOWN_TABLE_RE.search(content) or _MARKDOWN_HINT_RE.search(content):
+            return "interactive", _build_markdown_card_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
 
@@ -4599,7 +4830,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return response
             except Exception as exc:
                 last_error = exc
-                if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                if msg_type in {"post", "interactive"} and _PAYLOAD_FIELD_INVALID_RE.search(str(exc)):
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
