@@ -24,7 +24,6 @@ class TestRoundTrip(unittest.TestCase):
             model="deepseek-v4-pro",
             provider="openrouter",
             base_url="https://openrouter.ai/api/v1",
-            api_key="sk-test",
             api_mode="chat_completions",
         )
         ok = set_session_model_config(
@@ -38,7 +37,6 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(loaded.model, "deepseek-v4-pro")
         self.assertEqual(loaded.provider, "openrouter")
         self.assertEqual(loaded.base_url, "https://openrouter.ai/api/v1")
-        self.assertEqual(loaded.api_key, "sk-test")
         self.assertEqual(loaded.api_mode, "chat_completions")
 
     def test_get_none_for_missing_session(self):
@@ -86,7 +84,7 @@ class TestRoundTrip(unittest.TestCase):
         ])
         self.assertEqual(memory.model_config, {
             "model": "m1", "provider": "p1",
-            "base_url": "", "api_key": "", "api_mode": "",
+            "base_url": "", "api_mode": "",
             "requested_at": memory.model_config.get("requested_at", 0.0),
         })
 
@@ -108,14 +106,13 @@ class TestFromDict(unittest.TestCase):
 
     def test_to_dict_round_trip(self):
         cfg = SessionModelConfig(
-            model="m1", provider="p1", base_url="u", api_key="k",
+            model="m1", provider="p1", base_url="u",
             api_mode="a", requested_at=12345.0,
         )
         d = cfg.to_dict()
         self.assertEqual(d["model"], "m1")
         self.assertEqual(d["provider"], "p1")
         self.assertEqual(d["base_url"], "u")
-        self.assertEqual(d["api_key"], "k")
         self.assertEqual(d["api_mode"], "a")
         self.assertEqual(d["requested_at"], 12345.0)
 

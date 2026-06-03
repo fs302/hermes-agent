@@ -11258,7 +11258,6 @@ class GatewayRunner:
                     model=result.new_model,
                     provider=result.target_provider or "",
                     base_url=result.base_url or "",
-                    api_key=result.api_key or "",
                     api_mode=result.api_mode or "",
                     requested_at=_t.time(),
                 ),

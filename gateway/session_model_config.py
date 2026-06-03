@@ -36,7 +36,6 @@ class SessionModelConfig:
     model: str
     provider: str = ""
     base_url: str = ""
-    api_key: str = ""
     api_mode: str = ""
     requested_at: float = 0.0  # unix seconds
 
@@ -45,7 +44,6 @@ class SessionModelConfig:
             "model": self.model,
             "provider": self.provider,
             "base_url": self.base_url,
-            "api_key": self.api_key,
             "api_mode": self.api_mode,
             "requested_at": self.requested_at,
         }
@@ -58,7 +56,6 @@ class SessionModelConfig:
             model=str(d.get("model") or ""),
             provider=str(d.get("provider") or ""),
             base_url=str(d.get("base_url") or ""),
-            api_key=str(d.get("api_key") or ""),
             api_mode=str(d.get("api_mode") or ""),
             requested_at=float(d.get("requested_at") or 0.0),
         )
