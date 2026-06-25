@@ -3307,6 +3307,40 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _get_extra_service_env() -> dict[str, str]:
+    """Read HERMES_SERVICE_EXTRA_ENV from Hermes .env (e.g. "NO_PROXY=*,FOO=bar").
+
+    Users add platform-specific service env vars (e.g. NO_PROXY to bypass a local
+    proxy) in ~/.hermes/.env via HERMES_SERVICE_EXTRA_ENV. We parse the
+    comma-separated KEY=VALUE pairs here and inject them into the generated
+    launchd plist / systemd unit so they survive gateway restarts.
+
+    Backed by env_loader.load_hermes_dotenv to ensure the same .env sanitisation
+    and override semantics used elsewhere in Hermes.
+    """
+    raw: str = ""
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+        load_hermes_dotenv()
+        raw = os.environ.get("HERMES_SERVICE_EXTRA_ENV", "") or ""
+    except Exception:
+        # best-effort: never block plist generation on .env parse errors
+        return {}
+
+    import re as _re
+    extra: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            extra[key] = value
+    return extra
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     # Stable cwd anchor — never the volatile source checkout. See
@@ -3338,6 +3372,20 @@ def generate_launchd_plist() -> str:
             priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
         )
     )
+
+    # Read user-defined extra service env vars from ~/.hermes/.env
+    # (HERMES_SERVICE_EXTRA_ENV="NO_PROXY=*,FOO=bar") and inject into the plist
+    # so they survive gateway restarts and (when self-heal kicks in) get
+    # re-applied automatically.
+    _extra_service_env = _get_extra_service_env()
+    extra_env_xml = ""
+    for _k, _v in _extra_service_env.items():
+        # XML-escape ampersands and angle brackets in user-provided values.
+        from xml.sax.saxutils import escape as _xml_escape
+        extra_env_xml += (
+            f"\n        <key>{_xml_escape(_k)}</key>\n"
+            f"        <string>{_xml_escape(_v)}</string>"
+        )
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
@@ -3379,7 +3427,7 @@ def generate_launchd_plist() -> str:
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{hermes_home}</string>{extra_env_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>
