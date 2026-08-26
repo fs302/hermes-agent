@@ -59,6 +59,23 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class CollapsedProgressCaptureAdapter(ProgressCaptureAdapter):
+    collapse_progress = True
+
+    async def edit_message(
+        self, chat_id, message_id, content, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
     """Capture sends while exercising Discord's real preview formatter."""
 
@@ -815,6 +832,21 @@ class CommentaryAgent:
         }
 
 
+class CollapsedProgressAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "first", {})
+        time.sleep(0.35)
+        self.interim_assistant_callback("Checking the result.", already_streamed=False)
+        self.tool_progress_callback("tool.started", "terminal", "second", {})
+        time.sleep(1.7)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1181,6 +1213,39 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_feishu_collapses_thinking_and_tools_into_one_progress_message(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CollapsedProgressAgent,
+        session_id="sess-feishu-collapsed-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "thinking_progress": True,
+                "interim_assistant_messages": True,
+            },
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="direct",
+        thread_id=None,
+        adapter_cls=CollapsedProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"]["_hermes_progress"] is True
+    assert adapter.edits
+    assert {edit["message_id"] for edit in adapter.edits} == {"progress-1"}
+    assert "Checking the result." in adapter.edits[-1]["content"]
+    assert "second" in adapter.edits[-1]["content"]
 
 
 class TransformedStreamAgent:

@@ -101,6 +101,8 @@ GetMessageResourceRequest = None  # type: ignore[assignment]
 P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
 ReplyMessageRequest = None  # type: ignore[assignment]
 ReplyMessageRequestBody = None  # type: ignore[assignment]
+PatchMessageRequest = None  # type: ignore[assignment]
+PatchMessageRequestBody = None  # type: ignore[assignment]
 UpdateMessageRequest = None  # type: ignore[assignment]
 UpdateMessageRequestBody = None  # type: ignore[assignment]
 AccessTokenType = None  # type: ignore[assignment]
@@ -191,6 +193,10 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_RICH_PAYLOAD_INVALID_RE = re.compile(
+    r"content format of the post type is incorrect|field validation failed",
+    re.IGNORECASE,
+)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -1402,6 +1408,7 @@ def _load_lark_oapi() -> bool:
                 CreateMessageRequest, CreateMessageRequestBody,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
                 P2ImMessageMessageReadV1,
+                PatchMessageRequest, PatchMessageRequestBody,
                 ReplyMessageRequest, ReplyMessageRequestBody,
                 UpdateMessageRequest, UpdateMessageRequestBody,
             )
@@ -1429,6 +1436,8 @@ def _load_lark_oapi() -> bool:
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
@@ -1504,6 +1513,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
+        self.collapse_progress = _to_boolean(
+            (config.extra or {}).get(
+                "collapse_progress",
+                os.getenv("FEISHU_COLLAPSE_PROGRESS", "false"),
+            )
+        )
+        self._card_message_ids: set[str] = set()
         self._client: Optional[Any] = None
         # Adapter-owned thread pool for blocking Feishu SDK calls. Routing SDK
         # work through this pool (instead of asyncio's shared default executor)
@@ -1945,6 +1961,47 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    @staticmethod
+    def _render_v2_card(content: str, *, progress: bool = False) -> str:
+        if progress:
+            elements = [
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": "查看 thinking / tool 过程",
+                        }
+                    },
+                    "elements": [{"tag": "markdown", "content": content or "…"}],
+                }
+            ]
+            title = "🔧 Hermes 正在处理"
+        else:
+            elements = [{"tag": "markdown", "content": content or " "}]
+            plain = _strip_markdown_to_plain_text(content)
+            title = next((line.strip() for line in plain.splitlines() if line.strip()), "Hermes")[:60]
+        return json.dumps(
+            {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True, "update_multi": True},
+                "header": {
+                    "template": "blue",
+                    "title": {"tag": "plain_text", "content": title},
+                },
+                "body": {"elements": elements},
+            },
+            ensure_ascii=False,
+        )
+
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        return self.collapse_progress
+
     async def send(
         self,
         chat_id: str,
@@ -1967,11 +2024,17 @@ class FeishuAdapter(BasePlatformAdapter):
         # uses ``post``. See #26841.
         prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
+        is_progress = self.collapse_progress and bool(
+            (metadata or {}).get("_hermes_progress")
+        )
+        is_final = self.collapse_progress and bool((metadata or {}).get("notify"))
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(
-                    chunk, prefer_post=prefer_post,
+                msg_type, payload = (
+                    ("interactive", self._render_v2_card(chunk, progress=is_progress))
+                    if is_progress or is_final
+                    else self._build_outbound_payload(chunk, prefer_post=prefer_post)
                 )
                 try:
                     response = await self._feishu_send_with_retry(
@@ -1982,9 +2045,13 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    if (
+                        msg_type not in {"post", "interactive"}
+                        or not _RICH_PAYLOAD_INVALID_RE.search(str(exc))
+                    ):
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    logger.warning("[Feishu] Rich payload rejected by API; falling back to plain text")
+                    msg_type = "text"
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
@@ -1993,11 +2060,14 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 if (
-                    msg_type == "post"
+                    msg_type in {"post", "interactive"}
                     and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    and _RICH_PAYLOAD_INVALID_RE.search(
+                        str(getattr(response, "msg", "") or "")
+                    )
                 ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    logger.warning("[Feishu] Rich payload rejected by API response; falling back to plain text")
+                    msg_type = "text"
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
@@ -2006,6 +2076,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 last_response = response
+
+                if is_progress and self._response_succeeded(response):
+                    message_id = self._extract_response_field(response, "message_id")
+                    if message_id:
+                        self._card_message_ids.add(str(message_id))
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
@@ -2019,13 +2094,28 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu message without changing its type."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
         try:
+            if message_id in self._card_message_ids:
+                payload = self._render_v2_card(content, progress=True)
+                body = self._build_patch_message_body(content=payload)
+                request = self._build_patch_message_request(
+                    message_id=message_id, request_body=body
+                )
+                response = await self._run_blocking(
+                    self._client.im.v1.message.patch, request
+                )
+                result = self._finalize_send_result(response, "patch failed")
+                if result.success:
+                    result.message_id = message_id
+                return result
+
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
@@ -5150,6 +5240,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if UpdateMessageRequest is not None:
             return (
                 UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if PatchMessageRequestBody is not None:
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if PatchMessageRequest is not None:
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()

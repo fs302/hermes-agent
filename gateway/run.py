@@ -4779,6 +4779,11 @@ class TurnRunner:
         if not adapter:
             return
 
+        collapse_progress = bool(getattr(adapter, "collapse_progress", False))
+        progress_metadata = dict(ctx._progress_metadata or {})
+        if collapse_progress:
+            progress_metadata["_hermes_progress"] = True
+
         if ctx._native_slack_task_cards and hasattr(
             adapter, "send_native_task_card_progress"
         ):
@@ -4836,7 +4841,7 @@ class TurnRunner:
         # Detect whether the adapter's edit_message accepts metadata so
         # overflow edits preserve Telegram topic/thread routing (#27487).
         _edit_accepts_metadata = False
-        if ctx._progress_metadata:
+        if progress_metadata:
             try:
                 _edit_params = inspect.signature(adapter.edit_message).parameters
                 _edit_accepts_metadata = (
@@ -4858,7 +4863,7 @@ class TurnRunner:
             if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
                 kwargs["finalize"] = True
             if _edit_accepts_metadata:
-                kwargs["metadata"] = ctx._progress_metadata
+                kwargs["metadata"] = progress_metadata
             return await adapter.edit_message(**kwargs)
 
         def _progress_text(lines: list) -> str:
@@ -4892,7 +4897,7 @@ class TurnRunner:
                 chat_id=ctx.source.chat_id,
                 content=text,
                 reply_to=ctx._progress_reply_to,
-                metadata=ctx._progress_metadata,
+                metadata=progress_metadata,
             )
             _track_progress_result(result)
             return result
@@ -4984,10 +4989,11 @@ class TurnRunner:
                     # order. Mirrors GatewayStreamConsumer.on_segment_break
                     # on the content side. (Issue: tool + content
                     # linearization regression after PR #7885.)
-                    progress_msg_id = None
-                    progress_lines = []
-                    ctx.last_progress_msg[0] = None
-                    ctx.repeat_count[0] = 0
+                    if not collapse_progress:
+                        progress_msg_id = None
+                        progress_lines = []
+                        ctx.last_progress_msg[0] = None
+                        ctx.repeat_count[0] = 0
                     continue
                 else:
                     msg = raw
@@ -4997,7 +5003,7 @@ class TurnRunner:
                     _last_edit_ts = time.monotonic()
                     await asyncio.sleep(0.3)
                     if ctx._run_still_current():
-                        await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+                        await adapter.send_typing(ctx.source.chat_id, metadata=progress_metadata)
                     continue
 
                 # Throttle edits: batch rapid tool updates into fewer
@@ -5047,7 +5053,7 @@ class TurnRunner:
                             chat_id=ctx.source.chat_id,
                             content=msg,
                             reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                            metadata=progress_metadata,
                         )
                         if (
                             ctx._cleanup_progress
@@ -5063,7 +5069,7 @@ class TurnRunner:
                             chat_id=ctx.source.chat_id,
                             content=full_text,
                             reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                            metadata=progress_metadata,
                         )
                     else:
                         # Editing unsupported: send just this line
@@ -5071,7 +5077,7 @@ class TurnRunner:
                             chat_id=ctx.source.chat_id,
                             content=msg,
                             reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                            metadata=progress_metadata,
                         )
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
@@ -5083,7 +5089,7 @@ class TurnRunner:
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
                 if ctx._run_still_current():
-                    await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+                    await adapter.send_typing(ctx.source.chat_id, metadata=progress_metadata)
 
             except queue.Empty:
                 await asyncio.sleep(0.3)
@@ -5101,17 +5107,18 @@ class TurnRunner:
                             # Content-bubble marker during drain: close off
                             # the current progress bubble and start a fresh
                             # one for any tool lines that arrived after.
-                            await _roll_progress_overflow_if_needed()
-                            if can_edit and progress_lines and progress_msg_id:
-                                _pending_text = _progress_text(progress_lines)
-                                try:
-                                    await _edit_progress_message(progress_msg_id, _pending_text)
-                                except Exception:
-                                    pass
-                            progress_msg_id = None
-                            progress_lines = []
-                            ctx.last_progress_msg[0] = None
-                            ctx.repeat_count[0] = 0
+                            if not collapse_progress:
+                                await _roll_progress_overflow_if_needed()
+                                if can_edit and progress_lines and progress_msg_id:
+                                    _pending_text = _progress_text(progress_lines)
+                                    try:
+                                        await _edit_progress_message(progress_msg_id, _pending_text)
+                                    except Exception:
+                                        pass
+                                progress_msg_id = None
+                                progress_lines = []
+                                ctx.last_progress_msg[0] = None
+                                ctx.repeat_count[0] = 0
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
@@ -5423,6 +5430,8 @@ class TurnRunner:
         # Set up stream consumer for token streaming or interim commentary.
         _stream_consumer = None
         _stream_delta_cb = None
+        _adapter = self._runner._adapter_for_source(ctx.source)
+        _collapse_progress = bool(getattr(_adapter, "collapse_progress", False))
         # #60671 — streaming TTS consumer is created on the outer
         # event-loop thread before run_sync launches.  run_sync only
         # reads it via ``streaming_tts_consumer_holder[0]`` for delta
@@ -5445,13 +5454,12 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
+        _want_stream_deltas = _streaming_enabled and not _collapse_progress
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
-                _adapter = self._runner._adapter_for_source(ctx.source)
                 if _adapter:
                     _consumer_cfg, _pause_typing_before_finalize = (
                         self._runner._build_stream_consumer_config(
@@ -5496,6 +5504,13 @@ class TurnRunner:
             if not ctx._run_still_current():
                 return
             display_text = text
+            if (
+                _collapse_progress
+                and ctx.progress_queue is not None
+                and str(display_text or "").strip()
+            ):
+                ctx.progress_queue.put(display_text)
+                return
             if _stream_consumer is not None:
                 if already_streamed:
                     _stream_consumer.on_segment_break()
